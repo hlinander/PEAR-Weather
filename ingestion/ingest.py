@@ -1,0 +1,528 @@
+import argparse
+import time
+from pathlib import Path
+import duckdb
+
+# Table configuration
+MODEL_PARAMETER = "model_parameter"
+TRAIN_STEP_METRIC = "train_step_metric"
+CHECKPOINT_SAMPLE_METRIC = "checkpoint_sample_metric"
+MODELS_TABLE_NAME = "models"
+RUNS_TABLE_NAME = "runs"
+TRAIN_STEPS_TABLE_NAME = "train_steps"
+CHECKPOINTS_TABLE_NAME = "checkpoints"
+ARTIFACTS_TABLE_NAME = "artifacts"
+ARTIFACT_CHUNKS_TABLE_NAME = "artifact_chunks"
+
+SYNC_TABLES = [
+    MODEL_PARAMETER,
+    TRAIN_STEP_METRIC,
+    CHECKPOINT_SAMPLE_METRIC,
+    MODELS_TABLE_NAME,
+    RUNS_TABLE_NAME,
+    TRAIN_STEPS_TABLE_NAME,
+    CHECKPOINTS_TABLE_NAME,
+    ARTIFACTS_TABLE_NAME,
+    ARTIFACT_CHUNKS_TABLE_NAME,
+]
+TYPES = ["int", "float", "text"]
+
+
+def ensure_central_schema(conn):
+    """
+    Ensure all central database tables exist (idempotent).
+
+    Creates the split schema where each table type (model_parameter, train_step_metric,
+    checkpoint_sample_metric) is split into separate tables by value type (int, float, text).
+    """
+    # Model parameter tables (split by type)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_parameter_int (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            value BIGINT
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_parameter_float (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            value FLOAT
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_parameter_text (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            value TEXT
+        )
+    """
+    )
+
+    # Train step metric tables (split by type)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS train_step_metric_int (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            step INTEGER,
+            value BIGINT
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS train_step_metric_float (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            step INTEGER,
+            value FLOAT
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS train_step_metric_text (
+            model_id BIGINT,
+            run_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            name TEXT,
+            step INTEGER,
+            value TEXT
+        )
+    """
+    )
+
+    # Checkpoint sample metric tables (split by type)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkpoint_sample_metric_int (
+            model_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            step INTEGER,
+            name TEXT,
+            dataset TEXT,
+            sample_ids INTEGER[],
+            mean BIGINT,
+            value_per_sample BIGINT[]
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkpoint_sample_metric_float (
+            model_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            step INTEGER,
+            name TEXT,
+            dataset TEXT,
+            sample_ids INTEGER[],
+            mean FLOAT,
+            value_per_sample FLOAT[]
+        )
+    """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkpoint_sample_metric_text (
+            model_id BIGINT,
+            timestamp TIMESTAMPTZ,
+            step INTEGER,
+            name TEXT,
+            dataset TEXT,
+            sample_ids INTEGER[],
+            mean TEXT,
+            value_per_sample TEXT[]
+        )
+    """
+    )
+
+    # Models table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS models (
+            id BIGINT,
+            train_id TEXT,
+            timestamp TIMESTAMPTZ
+        )
+    """
+    )
+
+    # Runs table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id BIGINT,
+            model_id BIGINT,
+            timestamp TIMESTAMPTZ
+        )
+    """
+    )
+
+    # Train steps table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS train_steps (
+            model_id BIGINT,
+            run_id BIGINT,
+            step INTEGER,
+            dataset TEXT,
+            sample_ids INTEGER[],
+            timestamp TIMESTAMPTZ
+        )
+    """
+    )
+
+    # Checkpoints table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            model_id BIGINT,
+            step INTEGER,
+            path TEXT,
+            timestamp TIMESTAMPTZ
+        )
+    """
+    )
+
+    # Artifacts table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            id BIGINT,
+            timestamp TIMESTAMPTZ,
+            model_id BIGINT,
+            name TEXT,
+            path TEXT,
+            type TEXT,
+            size INTEGER
+        )
+    """
+    )
+
+    # Artifact chunks table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS artifact_chunks (
+            artifact_id BIGINT,
+            seq_num INTEGER,
+            data BYTEA,
+            size INTEGER,
+            timestamp TIMESTAMPTZ
+        )
+    """
+    )
+
+
+def ensure_ingestion_state_table(conn):
+    """Ensure the ingestion state tracking table exists"""
+    # DuckLake doesn't support PRIMARY KEY, so we use a plain table
+    # and handle duplicates manually in mark_file_processed
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_state (
+            file_path TEXT,
+            ingested_at TIMESTAMP,
+            row_count INTEGER
+        )
+        """
+    )
+
+
+def get_processed_files(conn) -> set[str]:
+    """Get set of already processed file paths"""
+    result = conn.execute("SELECT DISTINCT file_path FROM ingestion_state").fetchall()
+    return {row[0] for row in result}
+
+
+def mark_file_processed(conn, file_path: str, row_count: int):
+    """
+    Mark a file as processed using INSERT OR IGNORE pattern.
+
+    Since DuckLake doesn't support PRIMARY KEY, we check if the file
+    already exists before inserting.
+    """
+    # Check if already processed
+    exists = conn.execute(
+        "SELECT 1 FROM ingestion_state WHERE file_path = ? LIMIT 1", (file_path,)
+    ).fetchone()
+
+    if not exists:
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (file_path, ingested_at, row_count)
+            VALUES (?, now(), ?)
+            """,
+            (file_path, row_count),
+        )
+
+
+def list_filesystem_files(staging_dir: Path, table_name: str) -> list[str]:
+    """List all parquet files in a filesystem directory for a given table"""
+    table_dir = staging_dir / table_name
+    if not table_dir.exists():
+        return []
+
+    files = []
+    for file_path in table_dir.glob("*.parquet"):
+        # Return absolute path as string
+        files.append(str(file_path.absolute()))
+
+    return files
+
+
+def move_filesystem_file(source_path: Path, archive_dir: Path, table_name: str):
+    """Move a file from staging to archive on filesystem"""
+    import shutil
+
+    # Create archive directory structure
+    archive_table_dir = archive_dir / table_name
+    archive_table_dir.mkdir(parents=True, exist_ok=True)
+
+    # Destination path
+    dest_path = archive_table_dir / source_path.name
+
+    # Move file
+    shutil.move(str(source_path), str(dest_path))
+    print(f"[archive] Moved {source_path} -> {dest_path}")
+
+
+def ingest_table(
+    conn,
+    table_name: str,
+    parquet_files: list[str],
+    processed_files: set[str],
+    dry_run: bool = False,
+) -> int:
+    """
+    Ingest a single unified table, splitting by type
+
+    Args:
+        conn: DuckDB connection
+        table_name: Name of the table to ingest
+        parquet_files: List of parquet file paths
+        processed_files: Set of already processed file paths
+        dry_run: If True, don't actually modify the database
+
+    Returns the number of files processed
+    """
+    files_to_process = [f for f in parquet_files if f not in processed_files]
+
+    if not files_to_process:
+        print(f"[ingest] No new files to process for {table_name}")
+        return 0
+
+    print(f"[ingest] Processing {len(files_to_process)} files for {table_name}")
+
+    total_rows = 0
+
+    for file_path in files_to_process:
+        print(f"[ingest]   Processing {file_path}")
+
+        if dry_run:
+            print(f"[ingest]   DRY RUN - would process {file_path}")
+            continue
+
+        # Get row count
+        row_count_result = conn.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{file_path}')"
+        ).fetchone()
+        file_row_count = row_count_result[0] if row_count_result else 0
+
+        # Handle tables that need type splitting (metrics)
+        if table_name in [MODEL_PARAMETER, TRAIN_STEP_METRIC, CHECKPOINT_SAMPLE_METRIC]:
+            # Split by type and insert into type-specific tables
+            for type_name in TYPES:
+                value_col = f"value_{type_name}"
+                target_table = f"{table_name}_{type_name}"
+
+                if table_name == MODEL_PARAMETER:
+                    # Use INSERT BY NAME to match columns by name, not position
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_table} BY NAME
+                        SELECT
+                            model_id,
+                            run_id,
+                            timestamp,
+                            name,
+                            {value_col} as value
+                        FROM read_parquet('{file_path}')
+                        WHERE type = '{type_name}' AND {value_col} IS NOT NULL
+                        """
+                    )
+                elif table_name == TRAIN_STEP_METRIC:
+                    # Use INSERT BY NAME to match columns by name, not position
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_table} BY NAME
+                        SELECT
+                            model_id,
+                            run_id,
+                            timestamp,
+                            name,
+                            step,
+                            {value_col} as value
+                        FROM read_parquet('{file_path}')
+                        WHERE type = '{type_name}' AND {value_col} IS NOT NULL
+                        """
+                    )
+                elif table_name == CHECKPOINT_SAMPLE_METRIC:
+                    # Use INSERT BY NAME to match columns by name, not position
+                    mean_col = f"mean_{type_name}"
+                    value_per_sample_col = f"value_per_sample_{type_name}"
+
+                    conn.execute(
+                        f"""
+                        INSERT INTO {target_table} BY NAME
+                        SELECT
+                            model_id,
+                            timestamp,
+                            step,
+                            name,
+                            dataset,
+                            sample_ids,
+                            {mean_col} as mean,
+                            {value_per_sample_col} as value_per_sample
+                        FROM read_parquet('{file_path}')
+                        WHERE type = '{type_name}' AND {mean_col} IS NOT NULL
+                        """
+                    )
+        else:
+            # Direct copy for tables that don't need type splitting
+            # (models, runs, train_steps, checkpoints, artifacts, artifact_chunks)
+            conn.execute(
+                f"""
+                INSERT INTO {table_name} BY NAME
+                SELECT * FROM read_parquet('{file_path}')
+                """
+            )
+
+        # Mark file as processed
+        mark_file_processed(conn, file_path, file_row_count)
+        total_rows += file_row_count
+
+    print(
+        f"[ingest] Ingested {total_rows} total rows from {len(files_to_process)} files"
+    )
+    return len(files_to_process)
+
+
+def ingest_all_from_config(config, dry_run: bool = False):
+    """
+    Ingest data using AnalyticsConfig
+
+    This automatically:
+    - Detects staging type
+    - Connects to the appropriate central database
+
+    Args:
+        config: AnalyticsConfig instance (or None to load from env.py)
+        dry_run: If True, don't actually modify the database
+    """
+    from lib.analytics_config import analytics_config
+
+    if config is None:
+        config = analytics_config()
+
+    conn = duckdb.connect(str(config.central.db_path))
+
+    # Ensure schema exists (idempotent - safe to run every time)
+    print(f"[ingest] Ensuring central database schema exists")
+    ensure_central_schema(conn)
+    ensure_ingestion_state_table(conn)
+
+    # Get already processed files
+    processed_files = get_processed_files(conn)
+    print(f"[ingest] Already processed {len(processed_files)} files")
+
+    total_files = 0
+
+    print(f"[ingest] Using filesystem staging: {config.staging.staging_dir}")
+
+    staging_dir = Path(config.staging.staging_dir)
+    archive_dir = Path(config.staging.archive_dir)
+
+    # Process each table
+    for table_name in SYNC_TABLES:
+        # List files in staging directory
+        fs_files = list_filesystem_files(staging_dir, table_name)
+        print(f"[ingest] Found {len(fs_files)} files for {table_name}")
+
+        # Ingest (DuckDB's read_parquet works with filesystem paths)
+        files_processed = ingest_table(
+            conn, table_name, fs_files, processed_files, dry_run
+        )
+        total_files += files_processed
+
+        # Archive processed files
+        if not dry_run and files_processed > 0:
+            newly_processed = set(fs_files) - processed_files
+            for file_path_str in newly_processed:
+                file_path = Path(file_path_str)
+                move_filesystem_file(file_path, archive_dir, table_name)
+
+    print(f"[ingest] Ingestion complete. Processed {total_files} files.")
+    conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Ingest unified Parquet files from staging into central database using AnalyticsConfig from env.py"
+    )
+
+    parser.add_argument("--dry-run", action="store_true", help="Don't modify database")
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Run continuously (polling mode)",
+    )
+
+    args = parser.parse_args()
+
+    # Load config from env.py
+    from lib.analytics_config import analytics_config
+
+    config = analytics_config()
+
+    print(f"[ingest] Using AnalyticsConfig from env.py")
+    print(f"[ingest]   Staging: {config.staging.type}")
+    print(f"[ingest]   Central: {config.central.type}")
+
+    if args.continuous:
+        interval = config.ingest_interval_seconds
+        print(
+            f"[ingest] Running in continuous mode (interval: {interval}s from config)"
+        )
+        while True:
+            try:
+                ingest_all_from_config(config, dry_run=args.dry_run)
+            except Exception as e:
+                print(f"[ingest] Error during ingestion: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+            print(f"[ingest] Sleeping for {interval} seconds...")
+            time.sleep(interval)
+    else:
+        ingest_all_from_config(config, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

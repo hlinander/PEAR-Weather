@@ -1,0 +1,16 @@
+checkpoints/
+database.csv
+database.df.pickle
+__pycache__
+image.sif
+distributed_training_requests/
+distributed_training_requests/*
+locks/
+*.npy
+artifacts
+
+central.db
+central.db.wal
+
+*.db
+*.db.wal

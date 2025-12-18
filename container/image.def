@@ -1,0 +1,9 @@
+bootstrap: docker
+from: nvcr.io/nvidia/pytorch:25.05-py3
+ 
+%environment
+export PYTHONNOUSERSITE=True
+
+%post
+curl -LsSf https://astral.sh/uv/install.sh | sh
+cp /root/.local/bin/uv /usr/bin/
