@@ -3,7 +3,7 @@ Official code for
 
 ["PEAR: Equal Area Weather Forecasting on the Sphere"](https://arxiv.org/abs/2505.17720)
 
-by *Hampus Linander, Christoffer Petersson, Daniel Persson, Jan E. Gerken*.
+by *Hampus Linander, Tage Tykesson, Pietro Rosso, Christoffer Petersson, Daniel Persson, Jan E. Gerken*.
 
 ## Abstract
 Machine learning methods for global medium-range weather forecasting have

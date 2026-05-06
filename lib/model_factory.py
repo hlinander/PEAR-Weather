@@ -6,6 +6,15 @@ from experiments.weather.models.pangu import PanguParametrized, PanguParametrize
 from experiments.weather.models.swin_hp_pangu_pad import SwinHPPanguPadConfig
 from experiments.weather.models.swin_hp_pangu_pad import SwinHPPanguPad
 
+from experiments.weather.models.pangu_physicsnemo import (
+    PanguPhysicsNemo,
+    PanguPhysicsNemoConfig,
+)
+from experiments.weather.models.fengwu_physicsnemo import (
+    FengwuPhysicsNemo,
+    FengwuPhysicsNemoConfig,
+)
+
 
 class _ModelFactory:
     def __init__(self):
@@ -13,6 +22,8 @@ class _ModelFactory:
         self.models[SwinHPPanguPadConfig.__name__] = SwinHPPanguPad
         self.models[PanguConfig.__name__] = Pangu
         self.models[PanguParametrizedConfig.__name__] = PanguParametrized
+        self.models[PanguPhysicsNemoConfig.__name__] = PanguPhysicsNemo
+        self.models[FengwuPhysicsNemoConfig.__name__] = FengwuPhysicsNemo
 
     def register(self, config_class, model_class):
         self.models[config_class.__name__] = model_class
